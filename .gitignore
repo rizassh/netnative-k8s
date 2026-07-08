@@ -1,4 +1,5 @@
-clab-*/          # dossiers de lab générés par containerlab
+# dossiers de lab générés par containerlab (runtime : .state, .tls, topology-data…)
+clab-*/
 *.log
 .env
 kubeconfig

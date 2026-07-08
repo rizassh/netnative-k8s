@@ -1,0 +1,68 @@
+name: leaf-spine
+
+topology:
+  kinds:
+    linux:
+      image: quay.io/frrouting/frr:10.2.6
+
+  nodes:
+    # --- SPINES ---
+    spine1:
+      kind: linux
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/spine1/frr.conf:/etc/frr/frr.conf
+
+    spine2:
+      kind: linux
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/spine2/frr.conf:/etc/frr/frr.conf
+
+    # --- LEAFS ---
+    leaf1:
+      kind: linux
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/leaf1/frr.conf:/etc/frr/frr.conf
+
+    leaf2:
+      kind: linux
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/leaf2/frr.conf:/etc/frr/frr.conf
+
+    # --- HOSTS ---
+    host1:
+      kind: linux
+      image: nicolaka/netshoot:latest
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.1.1.10/24 dev eth1
+        - ip route replace default via 10.1.1.1
+
+    host2:
+      kind: linux
+      image: nicolaka/netshoot:latest
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.1.2.10/24 dev eth1
+        - ip route replace default via 10.1.2.1
+
+  links:
+
+    # --- spine1 to leafs ---
+    - endpoints: [ "spine1:eth1", "leaf1:eth1" ]
+    - endpoints: [ "spine1:eth2", "leaf2:eth1" ]
+
+    # --- spine2 to leafs ---
+    - endpoints: [ "spine2:eth1", "leaf1:eth2" ]
+    - endpoints: [ "spine2:eth2", "leaf2:eth2" ]
+
+    # --- leafs to hosts ---
+    - endpoints: [ "leaf1:eth3", "host1:eth1" ]
+    - endpoints: [ "leaf2:eth3", "host2:eth1" ]
