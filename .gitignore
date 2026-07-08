@@ -1,0 +1,5 @@
+clab-*/          # dossiers de lab générés par containerlab
+*.log
+.env
+kubeconfig
+*.tmp
