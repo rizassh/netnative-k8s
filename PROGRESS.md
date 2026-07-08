@@ -26,6 +26,11 @@ session (ici ou à Claude Code) pour reprendre le fil.
   était neutralisé par un commentaire *inline* (non supporté par git), donc le dossier
   runtime `clab-leaf-spine/` généré par containerlab s'était retrouvé stagé ; désindexé
   via `git rm --cached` et désormais bien ignoré.
+- **Validé** : joignabilité host1 ↔ host2 de bout en bout à travers la fabric
+  (ping 0% loss). **ECMP** confirmé côté leaf : loopback distant `10.255.0.12/32`
+  installé avec double next-hop (`10.0.0.0`/spine1 + `10.0.0.4`/spine2, `weight 1`).
+  → underlay eBGP RFC 7938 opérationnel et load-balancé. Phase 1 terminée.
 - **Bloqué** : —
-- **Prochaine étape** : valider joignabilité host1 ↔ host2 de bout en bout + observer
-  l'**ECMP** côté leaves (`show ip route`, double next-hop vers les 2 spines).
+- **Prochaine étape** : Phase 2 — cluster **kind** + **Cilium**, faire peerer le
+  control plane BGP de Cilium avec les leaves ; annoncer pod CIDR + pool LoadBalancer
+  dans la fabric.
