@@ -34,3 +34,33 @@ session (ici ou à Claude Code) pour reprendre le fil.
 - **Prochaine étape** : Phase 2 — cluster **kind** + **Cilium**, faire peerer le
   control plane BGP de Cilium avec les leaves ; annoncer pod CIDR + pool LoadBalancer
   dans la fabric.
+
+## 2026-07-11 — Phase 2 (démarrage : cluster kind + attache à la fabric)
+- **Fait** :
+  - Cluster **kind** `l3bgp-cluster` créé (`k8s/config.yaml`), **single-node pour
+    l'instant** (`l3bgp-cluster-control-plane`, image `kindest/node:v1.35.0`, up) —
+    un **2ème nœud** sera ajouté plus tard. Config avec `disableDefaultCNI: true` :
+    on désactive le CNI par défaut de kind pour installer **Cilium** à la place
+    (control plane BGP requis en phase 2).
+  - Topologie clab retravaillée pour préparer l'attache du cluster à la fabric :
+    `host1`/`host2` (netshoot) **commentés** (gardés comme référence), remplacés par
+    un nœud `external-node1` de kind **`ext-container`** câblé sur `leaf1:eth3`.
+    Objectif : rattacher un conteneur existant (le nœud kind) à la fabric plutôt
+    qu'un host synthétique. **Design** : chaque nœud kind est rattaché à **un seul
+    leaf** (pas de dual-homing par nœud) ; la redondance viendra du 2ème nœud sur
+    l'autre leaf.
+- **Bloqué / à finir** :
+  - Fabric clab **pas redéployée** après la modif : le câblage `ext-container` est
+    posé sur disque mais **ni déployé ni validé** (`clab inspect` = aucun lab actif).
+  - `external-node1` (`ext-container`) **ne référence pas encore le conteneur cible**
+    (nom du nœud kind à préciser) — à vérifier avant `clab deploy`.
+  - Cilium **pas encore installé** ; peering BGP leaves ↔ Cilium **pas commencé**.
+- **Prochaine étape** :
+  1. Finaliser le nœud `ext-container` (pointer vers le conteneur kind) et redéployer
+     la fabric ; vérifier le lien leaf1 ↔ nœud kind.
+  2. Installer **Cilium** sur `l3bgp-cluster` (CNI + BGP control plane).
+  3. Configurer le peering eBGP Cilium ↔ leaf1 (et leaf2 ?), annoncer le **pod CIDR**
+     puis un **pool LoadBalancer** dans la fabric ; valider l'annonce côté leaves
+     (`show bgp ipv4 unicast`).
+- **Décisions actées** : 2ème nœud kind prévu plus tard ; **1 nœud = 1 leaf**
+  (nœud suivant sur `leaf2`) ; anciens `host1`/`host2` conservés en commentaire.
