@@ -38,12 +38,12 @@
       "icon": "leaf"
     },
     {
-      "id": "external-node1",
+      "id": "l3bgp-cluster-worker",
       "position": {
-        "x": 740,
+        "x": 440,
         "y": 600
       },
-      "icon": "client"
+      "icon": "cloud"
     },
     {
       "id": "host1",
@@ -52,6 +52,13 @@
         "y": 600
       },
       "icon": "client"
+    },
+    {
+      "id": "l3bgp-cluster-worker2",
+      "position": {
+        "x": 740,
+        "y": 600
+      }
     }
   ],
   "edgeAnnotations": [],

@@ -37,25 +37,19 @@ topology:
         - configs/leaf2/frr.conf:/etc/frr/frr.conf
 
     # --- HOSTS ---
-    external-node1:
+    l3bgp-cluster-worker:
       kind: ext-container
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.1.1.10/24 dev eth1
+        - ip route replace default via 10.1.1.1
 
-
-    # host1:
-    #   kind: linux
-    #   image: nicolaka/netshoot:latest
-    #   exec:
-    #     - ip link set eth1 up
-    #     - ip addr add 10.1.1.10/24 dev eth1
-    #     - ip route replace default via 10.1.1.1
-
-    # host2:
-    #   kind: linux
-    #   image: nicolaka/netshoot:latest
-    #   exec:
-    #     - ip link set eth1 up
-    #     - ip addr add 10.1.2.10/24 dev eth1
-    #     - ip route replace default via 10.1.2.1
+    l3bgp-cluster-worker2:
+      kind: ext-container
+      exec:
+        - ip link set eth1 up
+        - ip addr add 10.1.2.10/24 dev eth1
+        - ip route replace default via 10.1.2.1
 
   links:
 
@@ -68,7 +62,6 @@ topology:
     - endpoints: [ "spine2:eth2", "leaf2:eth2" ]
 
     # # --- leafs to hosts ---
-    # - endpoints: [ "leaf1:eth3", "host1:eth1" ]
-    # - endpoints: [ "leaf2:eth3", "host2:eth1" ]
+    - endpoints: [ "leaf1:eth3", "l3bgp-cluster-worker:eth1" ]
+    - endpoints: [ "leaf2:eth3", "l3bgp-cluster-worker2:eth1" ]
 
-    - endpoints: [ "leaf1:eth3", "external-node1:eth1" ]

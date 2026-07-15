@@ -4,3 +4,6 @@ clab-*/
 .env
 kubeconfig
 *.tmp
+# sources Cilium téléchargées pour l'install Helm (artefact de build, ~94 Mo)
+k8s/cilium-main*
+k8s/*.tar.gz
