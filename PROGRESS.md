@@ -121,3 +121,79 @@ session (ici ou à Claude Code) pour reprendre le fil.
 - **Décisions actées** : cluster = 1 control-plane + 2 workers ; seuls les **workers**
   sont câblés à la fabric (le control-plane reste sur le réseau kind `172.18.0.0/16`) ;
   `1 nœud = 1 leaf` confirmé et implémenté.
+
+## 2026-07-24 — Phase 2 (install Cilium reproductible + passage en native routing)
+- **Fait** :
+  - **Dette #1 soldée — l'install est dans le repo** : création de `k8s/cilium-values.yaml`,
+    commenté clé par clé (le *pourquoi*, pas le *quoi*). Plus aucune valeur passée en
+    `--set` sur la ligne de commande.
+  - **Dette #2 soldée — version épinglée** : abandon du chart `1.21.0-dev` /
+    `quay.io/cilium/cilium-ci:latest` (buildé depuis sources) au profit de la release
+    stable **1.19.6**. `k8s/main.tar.gz` (94 Mo) supprimé. Réinstall propre via
+    `helm uninstall` puis réinstall (downgrade de chart majeur → repartir de zéro
+    plutôt qu'un `upgrade` risqué côté CRD).
+  - **Création d'un `Makefile`** à la racine : point d'entrée unique du projet
+    (`fabric-up/down`, `cluster-up/down`, `cilium-install`, `cilium-status`).
+    `CILIUM_VERSION ?= 1.19.6` vit désormais dans le repo et non dans l'historique bash.
+    `helm upgrade --install` → cible idempotente, rejouable. `cilium-install` dépend de
+    `cilium-repo` : sur une machine neuve, la commande marche sans prérequis manuel.
+- **Décision d'archi tranchée — `routingMode: native`** (dette #3) :
+  - **`routingMode: native`** : plus d'encapsulation, le paquet quitte le nœud avec
+    l'IP du pod en source. En tunnel (défaut), la fabric n'aurait vu que du VXLAN entre
+    IP de nœuds et n'aurait jamais routé les pod CIDR — l'objectif *network-native*
+    tombait.
+  - **`ipv4NativeRoutingCIDR: 10.244.0.0/16`** : périmètre où Cilium **désactive le
+    masquerading**. Sans lui, le trafic pod↔pod inter-nœud sortirait SNAT en IP de nœud
+    (`10.1.1.10`) et la fabric ne verrait jamais une IP de pod. Couvre les 3 podCIDR
+    sans déborder (un `0.0.0.0/0` casserait la sortie internet). C'est une
+    **affirmation**, pas une action : Cilium ne fait rien pour la rendre vraie, c'est
+    le rôle du BGP.
+  - **`autoDirectNodeRoutes: false`** : le point le plus important. Ce flag aurait
+    installé une route directe vers le podCIDR de chaque autre nœud via son InternalIP.
+    Or les 3 nœuds partagent le **bridge Docker de kind** (`172.18.0.0/16`) : la route
+    aurait fonctionné, et le trafic pod↔pod serait passé par ce bridge de management
+    en **court-circuitant totalement la fabric** (ni leaf, ni spine, ni ECMP). Ça aurait
+    « marché » sans rien démontrer — un `ping` n'aurait rien révélé, seul un
+    `traceroute` l'aurait vu. Désactivé délibérément pour laisser le trou que le BGP
+    viendra combler.
+  - **`bgpControlPlane.enabled: true`** activé dès maintenant pour éviter une 3ᵉ
+    réinstallation.
+- **Validé** :
+  - Chart `cilium-1.19.6`, revision 1 (install propre), image
+    `quay.io/cilium/cilium:v1.19.6@sha256:0df5b27…` — release épinglée **avec digest**,
+    donc reproductible bit pour bit. 3/3 pods `cilium` Running.
+  - `cilium-dbg status` → **`Routing: Network: Native`**.
+  - **Le trou attendu est bien là** — table de routage de `worker`, avant/après :
+    - avant (tunnel) : `10.244.0.0/24` et `10.244.2.0/24` via `cilium_host`, **`mtu 1450`**
+      (= 1500 − 50 octets d'entête VXLAN, la signature du tunnel) ;
+    - après (native) : ces deux routes ont **disparu**, `worker` ne connaît plus que son
+      propre `10.244.1.0/24`. Les `mtu 1450` aussi → plus d'encapsulation.
+  - `Masquerading: IPTables [IPv4: Enabled]` reste affiché : **normal**, le masquerade
+    est actif pour la sortie internet, `ipv4NativeRoutingCIDR` en exempte les
+    destinations en `10.244.0.0/16`. Les deux réglages cohabitent.
+- **Attendu / pas un bug** : le pod↔pod **inter-nœud est cassé** à ce stade, faute de
+  route vers les podCIDR distants. C'est l'effet voulu de `autoDirectNodeRoutes: false`.
+- **Question ouverte identifiée pour le BGP** : la session BGP de Cilium partira de
+  l'**InternalIP** du nœud (`172.18.0.3`), pas de son IP fabric (`10.1.1.10`), alors que
+  leaf1 attend un voisin sur `10.1.1.0/24`. Piste retenue : **`CiliumBGPNodeConfigOverride`**
+  (un objet par nœud) pour fixer l'adresse locale de session + le router-ID — ces valeurs
+  étant spécifiques à chaque nœud, elles n'ont pas leur place dans des values Helm.
+  Bénéfice induit : le **next-hop annoncé suit la source de session**, donc le podCIDR
+  sera annoncé avec un next-hop que le leaf sait joindre en direct. Alternative écartée :
+  forcer `--node-ip` sur kubelet — `eth1` est créée par containerlab *après* le démarrage
+  du nœud kind, donc kubelet a déjà choisi `172.18.0.3` ; ordre de démarrage trop fragile.
+- **Bloqué** : —
+- **Prochaine étape** :
+  1. Redéployer la fabric (`make fabric-up`) — elle n'est pas active actuellement, et
+     les workers n'ont donc pas encore leur interface `eth1`.
+  2. **Objectif B** : déployer 2 pods sur les 2 workers, constater l'échec du pod↔pod
+     inter-nœud et savoir l'expliquer par la table de routage → point de comparaison
+     *avant* BGP.
+  3. Configurer le **BGP control plane** (`CiliumBGPClusterConfig` +
+     `CiliumBGPNodeConfigOverride`) : peering eBGP de chaque nœud avec **son** leaf,
+     annonce du pod CIDR, puis d'un pool LoadBalancer ; valider côté fabric
+     (`show bgp ipv4 unicast` sur leaf1/leaf2 et les spines, vérifier l'ECMP).
+- **Décisions actées** : `routingMode: native` + `autoDirectNodeRoutes: false` =
+  la fabric doit apprendre les podCIDR par eBGP, aucun raccourci L2 toléré ;
+  version Cilium épinglée dans le `Makefile` ; toute opération d'infra passe
+  désormais par une cible `make`.

@@ -1,0 +1,51 @@
+# Cilium — valeurs figées pour le cluster kind `l3bgp-cluster`.
+# Source de vérité : ce fichier. Ne rien passer en --set sur la ligne de commande.
+# Installation : `make cilium-install` (la version du chart y est épinglée).
+#
+# Objectif d'architecture : la fabric leaf-spine doit router NATIVEMENT les pod CIDR.
+# Les pods traversent donc le réseau avec leur vraie IP, et ce sont les leaves qui
+# apprennent les préfixes par eBGP — pas un tunnel qui les cache.
+
+ipam:
+  # Le kube-controller-manager alloue un /24 par nœud, découpé dans le podSubnet
+  # de kind (10.244.0.0/16 par défaut) : control-plane .0, worker .1, worker2 .2.
+  # C'est ce préfixe par nœud que Cilium annoncera en BGP à son leaf (phase 2).
+  mode: kubernetes
+
+# Pas d'encapsulation : le paquet sort du nœud tel quel, avec l'IP du pod en source.
+# En mode `tunnel` (le défaut), la fabric ne verrait que du VXLAN entre IP de nœuds
+# et n'aurait aucune visibilité sur les pod CIDR — l'intérêt du projet tomberait.
+routingMode: native
+
+# Périmètre dans lequel Cilium considère que le réseau sous-jacent sait router les
+# IP de pods, et où il DÉSACTIVE donc le masquerading (SNAT vers l'IP du nœud).
+# Sans ça, le trafic pod↔pod inter-nœud sortirait masqué en 10.1.1.10 et la fabric
+# ne verrait jamais une IP de pod.
+# Doit couvrir les podCIDR de tous les nœuds — présents et futurs — sans déborder :
+# un 0.0.0.0/0 casserait la sortie internet (retour impossible vers une IP de pod).
+# ATTENTION : c'est une AFFIRMATION, pas une action. Cilium ne fait rien pour la
+# rendre vraie ; c'est le rôle du BGP (phase 2) de remplir ce périmètre de routes.
+ipv4NativeRoutingCIDR: 10.244.0.0/16
+
+# Désactivé DÉLIBÉRÉMENT.
+# Ce flag ferait installer par Cilium une route directe vers le podCIDR de chaque
+# autre nœud, via son InternalIP. Or les 3 nœuds partagent le bridge Docker de kind
+# (172.18.0.0/16) : la route existerait, fonctionnerait... et le trafic pod↔pod
+# passerait par ce bridge de management en court-circuitant complètement la fabric
+# (ni leaf, ni spine, ni ECMP). Ça « marcherait » sans rien démontrer.
+# En le laissant à false, la route vers les podCIDR distants est volontairement
+# absente : c'est la place que viendra occuper l'annonce eBGP depuis les leaves.
+autoDirectNodeRoutes: false
+
+bgpControlPlane:
+  # Activé dès maintenant pour éviter une réinstallation ultérieure.
+  # La configuration du peering (CiliumBGPClusterConfig, et le CiliumBGPNodeConfig-
+  # Override qui fixera l'adresse locale de session par nœud — 10.1.1.10 sur worker,
+  # 10.1.2.10 sur worker2) viendra dans un manifeste séparé : ces valeurs sont
+  # spécifiques à chaque nœud et n'ont donc pas leur place dans des values Helm.
+  enabled: true
+
+image:
+  # Les images sont préchargées dans les nœuds kind : inutile d'interroger le
+  # registre à chaque démarrage de pod.
+  pullPolicy: IfNotPresent
