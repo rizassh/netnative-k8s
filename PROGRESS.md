@@ -197,3 +197,97 @@ session (ici ou à Claude Code) pour reprendre le fil.
   la fabric doit apprendre les podCIDR par eBGP, aucun raccourci L2 toléré ;
   version Cilium épinglée dans le `Makefile` ; toute opération d'infra passe
   désormais par une cible `make`.
+
+## 2026-07-28 (soirée) — Phase 2 (préparation du workload de test « avant BGP »)
+Session courte, consacrée à l'**objectif B** : déployer 2 pods sur les 2 workers pour
+constater l'échec du pod↔pod inter-nœud *avant* d'activer le BGP. Le workload n'est pas
+encore déployé, mais deux contraintes d'environnement inattendues ont été identifiées
+et documentées — c'est le vrai acquis de la soirée.
+
+- **Fait** :
+  - **Fabric redéployée** (`make fabric-up`) : joignabilité leaf → nœud kind revalidée
+    (`leaf1 → 10.1.1.10`, `leaf2 → 10.1.2.10`).
+  - **Manifest `k8s/netshoot-daemonset.yaml` écrit**. Choix du **DaemonSet** plutôt qu'un
+    `Deployment` + `podAntiAffinity` ou 2 `Pod` bruts : garantit **un pod par nœud par
+    construction**, sans nom de nœud codé en dur, et colle au design `1 nœud = 1 leaf`.
+    Le taint `NoSchedule` posé par kind sur le control-plane suffit à l'en exclure —
+    aucune `toleration`, donc les pods atterrissent sur les 2 workers seulement.
+    `command: ["sleep","infinity"]` (l'entrypoint de netshoot rend la main → sinon
+    `CrashLoopBackOff`). **Pas de `hostNetwork`** : le pod aurait pris l'IP du nœud
+    (`172.18.0.x`) au lieu d'une IP de pod, et le test aurait perdu tout son sens.
+  - **Cible `netshoot-load` ajoutée au `Makefile`** (+ `workload-up` / `workload-down`).
+
+- **Découverte 1 — les nœuds attachés à la fabric n'ont plus d'egress internet.**
+  Containerlab **remplace la route par défaut** du nœud : `default via 10.1.1.1 dev eth1`,
+  il ne reste sur `eth0` qu'une route de lien vers `172.18.0.0/16`. Le trafic sortant part
+  donc vers `leaf1`, et la fabric est un monde clos (aucun NAT vers l'extérieur).
+  Preuve : `curl https://registry-1.docker.io/v2/` depuis `worker` → **exit 124 (timeout)**.
+  Conséquence : **kubelet ne peut plus pull aucune image** sur ces nœuds ⇒ toute image doit
+  être **préchargée** via `kind load`, et le manifest doit porter `imagePullPolicy: IfNotPresent`
+  (avec `Always`, kubelet retenterait un pull réseau et échouerait *même image présente*).
+  Ce n'est pas un bug mais un effet de bord assumé du design — c'est exactement la contrainte
+  d'un vrai DC en underlay pur. Explique rétroactivement le `image.pullPolicy` bricolé en
+  `--set` à l'époque de l'install Cilium.
+
+- **Découverte 2 — `kind load docker-image` est cassé par le containerd image store.**
+  `docker info` → `driver-type: io.containerd.snapshotter.v1`. Avec ce backend, Docker garde
+  l'**index multi-plateforme** complet de l'image alors qu'il n'a téléchargé que la variante
+  `linux/amd64`. Or kind importe avec `ctr images import --all-platforms`, qui tente de
+  résoudre *toutes* les entrées de l'index et échoue sur le manifeste arm64 absent :
+  `ctr: content digest sha256:f460dc5e…: not found`. Rien à voir avec le réseau ni le cluster.
+  → **Contournement retenu** : `docker save --platform linux/amd64 -o <tar>` puis
+  `kind load image-archive`, c.-à-d. une archive **mono-plateforme** ne contenant que ce
+  qu'on possède réellement. Fait à la main ce soir : **image chargée avec succès sur les
+  3 nœuds**.
+
+- **Bloqué / à finir (reprise ici) — la cible `netshoot-load` ne marche pas encore** :
+  1. `TAR=$$(mktemp …): \` — un **`:` au lieu d'un `;`**. Une fois les lignes recollées par
+     le `\`, le shell lit `TAR=… docker save …` : c'est la forme *affectation d'environnement
+     pour une seule commande*, donc `TAR` disparaît ensuite et `kind load` / `rm` reçoivent
+     une variable **vide**.
+  2. `mktemp /tmp/netshoot.tar` → `too few X's in template` (exit 1) : `mktemp` exige au moins
+     3 `X` consécutifs. Utiliser `…XXXXXX` + `--suffix=.tar` (cf. `man mktemp`).
+  3. **Enchaîner en `&&` (ou `set -e`) plutôt qu'en `;`** : avec des `;`, un échec de `mktemp`
+     ou de `docker save` n'interrompt rien, et Make renvoie le code du **dernier** `rm -f`
+     (qui réussit toujours) → la cible dirait « OK » sans avoir rien chargé.
+  4. **Ajouter le commentaire du *pourquoi*** au-dessus de la cible (les 2 découvertes
+     ci-dessus). Sans lui, la cible passe pour une complication gratuite face au
+     `kind load docker-image` d'une ligne, et quelqu'un la « simplifiera ».
+  5. **Trancher `workload-up: netshoot-load`** — dépendance ou pas ? Sans elle, itérations
+     rapides sur le YAML ; mais sur une machine neuve `make workload-up` donne des
+     `ImagePullBackOff`. Décider **et commenter le choix**.
+  6. `k8s/netshoot-daemonset.yaml` : **le namespace `netlab` n'est pas déclaré** alors que le
+     DaemonSet le référence → `apply` échouera. Ajouter l'objet `Namespace` **dans le même
+     fichier**, avant le DaemonSet, séparé par `---` (appliqué dans l'ordre du document ;
+     et `kubectl delete -f` nettoie tout par garbage collection).
+  7. Cosmétique : tabulation parasite dans `CILIUM_VERSION	?=`, alignement des variables,
+     espace manquant dans le séparateur `# --- Déploiement … -----`.
+
+- **Prochaine étape** :
+  1. Finir `netshoot-load` (points 1→5) et déclarer le namespace (point 6), puis
+     `make workload-up`.
+  2. **Objectif B — la séquence de mesure**, dans cet ordre :
+     a. `kubectl get pods -n netlab -o wide` → vérifier que les IP tombent bien dans
+        `10.244.1.x` (worker) et `10.244.2.x` (worker2).
+     b. ping **intra-nœud** → doit **réussir** (contrôle négatif : prouve que le CNI n'est
+        pas cassé — c'est l'étape que tout le monde saute, et c'est elle qui transforme
+        « mon cluster est cassé » en « j'ai laissé un trou délibéré »).
+     c. ping **pod worker → pod worker2** → doit **échouer**.
+     d. `docker exec l3bgp-cluster-worker ip route` → montrer l'absence de route vers
+        `10.244.2.0/24`. **Garder ces sorties** : c'est le « avant » de la démo.
+  3. Lire la doc BGP Cilium et noter *quel objet porte quoi* (`CiliumBGPClusterConfig`,
+     `CiliumBGPPeerConfig`, `CiliumBGPNodeConfigOverride`) : ASN, adresse du peer, adresse
+     locale de session, ce qu'on annonce.
+  4. Puis configurer le peering eBGP nœud ↔ son leaf et annoncer les podCIDR.
+
+- **À savoir pour le BGP (mise à jour d'une note du 24/07)** : les InternalIP des workers
+  ont **changé de place** au redémarrage (`worker` est passé de `172.18.0.3` à `172.18.0.4`,
+  et inversement pour `worker2`) — le bridge Docker réattribue selon l'ordre de démarrage.
+  Ces adresses sont donc **instables et inutilisables comme identité BGP durable** :
+  argument supplémentaire en faveur de `CiliumBGPNodeConfigOverride`, qui épinglera l'IP
+  fabric (`10.1.1.10` / `10.1.2.10`), stable car versionnée dans la topologie clab.
+
+- **Décisions actées** : workload de test = **DaemonSet** netshoot (`v0.16`, tag explicite,
+  jamais `latest`) ; images **préchargées** via archive mono-plateforme, jamais pullées
+  depuis les nœuds ; namespace dédié `netlab` déclaré **dans le manifest** et non créé
+  en impératif.

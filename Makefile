@@ -6,16 +6,20 @@
 
 # `?=` : valeur par défaut, surchargeable sans éditer ce fichier.
 #   ex. `make cilium-install CILIUM_VERSION=1.19.5`
-CILIUM_VERSION ?= 1.19.6
+CILIUM_VERSION	?= 1.19.6
+NETSHOOT_IMAGE   ?= nicolaka/netshoot:v0.16
+
+DOCKER_ARCH    := linux/amd64
 
 CLAB_TOPO      := clab/leaf-spine.clab.yml
 KIND_CONFIG    := k8s/config.yaml
 KIND_CLUSTER   := l3bgp-cluster
 CILIUM_VALUES  := k8s/cilium-values.yaml
+NETSHOOT_DAEMON := k8s/netshoot-daemonset.yaml
 
 # Cibles qui ne produisent pas de fichier portant leur nom.
 .PHONY: help fabric-up fabric-down cluster-up cluster-down \
-        cilium-repo cilium-install cilium-status
+        cilium-repo cilium-install cilium-status netshoot-load workload-up workload-down
 
 # Cible par défaut (la première du fichier) : `make` seul affiche l'aide.
 help:
@@ -26,6 +30,9 @@ help:
 	@echo "  cluster-down    - supprime le cluster kind"
 	@echo "  cilium-install  - installe/met a jour Cilium (version $(CILIUM_VERSION))"
 	@echo "  cilium-status   - etat de Cilium et mode de routage effectif"
+	@echo "  netshoot-load   - charge l'image netshoot"
+	@echo "  workload-up     - deploye le DaemonSet netshoot sur le cluster"
+	@echo "  workload-down   - supprime le DaemonSet netshoot du cluster"
 
 # --- Fabric (phase 1) -------------------------------------------------------
 # containerlab manipule les netns et les veth : root requis.
@@ -66,3 +73,20 @@ cilium-status:
 	@echo "--- mode de routage effectif (attendu : Native) ---"
 	@kubectl -n kube-system exec ds/cilium -- cilium-dbg status \
 	  | grep -Ei 'routing|masquerad'
+
+# --- Déploiement container sur le cluster--------------------------------------
+
+netshoot-load:
+	@echo "--- chargement de l'image $(NETSHOOT_IMAGE) dans le cluster kind ---"
+	docker pull $(NETSHOOT_IMAGE)
+	TAR=$$(mktemp /tmp/netshoot.tar): \
+	docker save --platform $(DOCKER_ARCH) \
+	$(NETSHOOT_IMAGE) -o $$TAR; \
+	kind load image-archive --name $(KIND_CLUSTER) $$TAR; \
+	rm -f $$TAR
+
+workload-up:
+	kubectl apply -f $(NETSHOOT_DAEMON)
+
+workload-down:
+	kubectl delete -f $(NETSHOOT_DAEMON)
