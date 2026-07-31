@@ -1,0 +1,29 @@
+# Peering complet du cote leaf1 : l3bgp-cluster-worker <-> leaf1 (AS65011).
+# Lien fabric : leaf1:eth3 <-> worker:eth1, 10.1.1.0/24.
+#
+# Un fichier par peering parce que `peerAddress` differe d'un noeud a l'autre et
+# n'est PAS surchargeable par NodeConfigOverride : il faut donc bien deux
+# CiliumBGPClusterConfig avec des nodeSelector disjoints.
+#
+# A ECRIRE ICI :
+#
+# 1. CiliumBGPClusterConfig
+#    - nodeSelector : ne doit matcher QUE worker. Utilise le label pose dans
+#      k8s/bootstrap/kind-config.yaml (pas kubernetes.io/hostname : on ne code
+#      pas un nom de noeud en dur).
+#    - bgpInstances[].localASN : cf. la decision ASN unique vs ASN par noeud.
+#    - bgpInstances[].peers[] : l'adresse de leaf1 sur le lien, son ASN, et le
+#      peerConfigRef vers le PeerConfig de bgp-common.yaml.
+#
+# 2. CiliumBGPNodeConfigOverride
+#    Le nom de l'objet doit correspondre au NOM DU NOEUD (c'est comme ca que
+#    Cilium l'associe — verifie-le).
+#    - routerID : identite BGP stable. Surtout pas une InternalIP (172.18.0.x) :
+#      elles changent de place au redemarrage du bridge Docker.
+#    - l'adresse locale de session : doit etre l'IP fabric du noeud, sinon la
+#      session partirait de 172.18.0.x et leaf1 refuserait un voisin inconnu.
+#      Effet induit a comprendre : le next-hop annonce suit la source de session,
+#      donc le podCIDR sera annonce avec un next-hop que leaf1 sait joindre en direct.
+#
+# COTE FABRIC : rien dans clab/configs/leaf1/frr.conf ne prevoit ce voisin
+# aujourd'hui. Le peering ne montera pas tant que les deux cotes ne sont pas ecrits.

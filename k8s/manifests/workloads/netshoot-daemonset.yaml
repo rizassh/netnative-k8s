@@ -1,0 +1,79 @@
+# Workload de test de la phase 2 — objectif B : mesurer le pod<->pod AVANT le BGP.
+#
+# Deux DaemonSets identiques a leurs labels pres => 2 pods par noeud, donc :
+#   - une paire INTRA-noeud (a <-> b sur le meme worker) : controle negatif,
+#     doit reussir, prouve que le datapath Cilium local n'est pas casse ;
+#   - une paire INTER-noeud (a sur worker <-> a sur worker2) : doit ECHOUER,
+#     faute de route vers le podCIDR distant (`autoDirectNodeRoutes: false`).
+#     C'est le trou delibere que le BGP viendra combler.
+#
+# Le Namespace est declare ICI et non cree en imperatif : `kubectl apply -f` traite
+# les documents dans l'ordre, il existe donc avant les DaemonSets qui le referencent.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netlab
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: netshoot-a
+  namespace: netlab
+  labels:
+    app: netshoot
+    pair: a
+spec:
+  # ATTENTION : `selector` est IMMUABLE apres creation. Les deux DaemonSets doivent
+  # selectionner des ensembles DISJOINTS — avec `app: netshoot` seul des deux cotes,
+  # chacun adopterait les pods de l'autre et ils se battraient pour les controler.
+  # D'ou la dimension `pair`. `app` reste commun pour un `kubectl get pods -l app=netshoot`.
+  selector:
+    matchLabels:
+      app: netshoot
+      pair: a
+  template:
+    metadata:
+      labels:
+        app: netshoot
+        pair: a
+    spec:
+      # Pas de `tolerations` : le taint NoSchedule pose par kind sur le control-plane
+      # suffit a l'exclure, les pods n'atterrissent que sur les 2 workers.
+      # Pas de `hostNetwork` non plus : le pod prendrait l'IP du noeud (172.18.0.x)
+      # au lieu d'une IP de pod, et le test perdrait tout son sens.
+      containers:
+        - name: netshoot
+          image: nicolaka/netshoot:v0.16
+          # Les noeuds attaches a la fabric n'ont pas d'egress internet : l'image est
+          # prechargee par `make netshoot-load`. Avec `Always`, kubelet retenterait un
+          # pull reseau et echouerait *meme image deja presente*.
+          imagePullPolicy: IfNotPresent
+          # L'entrypoint de netshoot rend la main immediatement -> le conteneur sortirait
+          # en `Completed` et kubelet le relancerait en boucle (CrashLoopBackOff).
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: netshoot-b
+  namespace: netlab
+  labels:
+    app: netshoot
+    pair: b
+spec:
+  selector:
+    matchLabels:
+      app: netshoot
+      pair: b
+  template:
+    metadata:
+      labels:
+        app: netshoot
+        pair: b
+    spec:
+      containers:
+        - name: netshoot
+          image: nicolaka/netshoot:v0.16
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]

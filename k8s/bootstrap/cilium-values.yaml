@@ -49,3 +49,21 @@ image:
   # Les images sont préchargées dans les nœuds kind : inutile d'interroger le
   # registre à chaque démarrage de pod.
   pullPolicy: IfNotPresent
+  # Par défaut le chart référence les images par digest
+  # (`quay.io/cilium/cilium:v1.19.6@sha256:0df5b27…`). Ce nom-là ne peut PAS être
+  # préchargé : `docker save` d'une référence à digest produit une archive sans
+  # nom, que containerd enregistre sous un nom inventé — kubelet ne l'y retrouve
+  # jamais et repart en pull réseau, ce que les nœuds attachés à la fabric ne
+  # peuvent pas faire (pas d'egress).
+  # On demande donc au chart des références par tag seul. L'épinglage n'est pas
+  # perdu : il vit dans k8s/bootstrap/images.txt, où le pull se fait par digest
+  # avant retag. Voir ce fichier pour le raisonnement complet.
+  useDigest: false
+
+operator:
+  image:
+    useDigest: false
+
+envoy:
+  image:
+    useDigest: false

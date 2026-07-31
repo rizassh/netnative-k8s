@@ -1,0 +1,36 @@
+# Images prechargees dans les noeuds kind par `make images-preload`.
+#
+# POURQUOI CE FICHIER EXISTE
+# Les noeuds attaches a la fabric n'ont plus d'egress internet : containerlab
+# remplace leur route par defaut (`default via 10.1.1.1 dev eth1`) et la fabric
+# n'a aucun NAT vers l'exterieur. kubelet ne peut donc pull AUCUNE image sur
+# worker/worker2 — toute image utilisee par le cluster doit figurer ici.
+#
+# POURQUOI LES DIGESTS SONT ICI ET PAS DANS LES MANIFESTES
+# Une image epinglee par digest ne peut pas etre prechargee : `docker save` d'une
+# reference a digest produit une archive sans nom (`"RepoTags": null`), que
+# containerd enregistre sous un nom invente (`import-<date>@sha256:...`). Kubelet
+# ne l'y retrouve jamais et repart en pull reseau.
+# La cible `images-preload` pull donc PAR DIGEST (contenu verifie a l'octet pres),
+# puis retague en `nom:tag` avant de sauvegarder. L'epinglage ne disparait pas :
+# il se deplace du manifeste vers ce fichier, qui devient la source de verite.
+# Corollaire : le chart Cilium doit emettre des references SANS digest
+# (`useDigest: false` dans cilium-values.yaml), sinon kubelet reclame un nom absent.
+#
+# FORMAT : une reference complete par ligne, avec son digest. Le tag local est
+# derive automatiquement en coupant a partir du `@`.
+# Lignes vides et lignes commencant par # ignorees.
+#
+# POUR METTRE A JOUR apres un bump de CILIUM_VERSION :
+#   helm template cilium cilium/cilium --version <X.Y.Z> \
+#     --namespace kube-system --values k8s/bootstrap/cilium-values.yaml \
+#     | grep -oP '(?<=image: ")[^"]+' | sort -u
+#   (le chart, lui, connait les digests : relever ceux qu'il affiche)
+
+# --- Cilium (CNI) — doivent correspondre a CILIUM_VERSION dans le Makefile ---
+quay.io/cilium/cilium:v1.19.6@sha256:0df5b2750b64c49843aba1d649e9eaf61467cb0645ad3171db6f6962c095ac92
+quay.io/cilium/operator-generic:v1.19.6@sha256:0db4ca4e06969d8904ee036617795d0e9c3228cf7b8d902ba74fc2bb98d2d665
+quay.io/cilium/cilium-envoy:v1.36.9-1782267392-edeb3f2af56c37c407efa1f63f0b32f595399bbc@sha256:767101fb8a5e38f055778cb43b7aa8eed80450b37f8121effac3d9de9e06dc99
+
+# --- Workload de test (phase 2) ---
+nicolaka/netshoot:v0.16@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70

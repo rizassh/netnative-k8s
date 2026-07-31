@@ -1,0 +1,26 @@
+# Ce qui est IDENTIQUE aux deux peerings (worker<->leaf1 et worker2<->leaf2).
+# Ces objets sont references PAR NOM depuis les ClusterConfig, donc ecrits une
+# seule fois et reutilises des deux cotes.
+#
+# A ECRIRE ICI :
+#
+# 1. CiliumBGPPeerConfig
+#    Le "profil" d'une session : timers, address families, graceful restart,
+#    eventuelles politiques d'import/export. Tout ce qui ne depend NI du noeud
+#    NI du leaf en face.
+#    C'est aussi lui qui pointe vers l'Advertisement ci-dessous (par label,
+#    pas par nom — regarde comment `families[].advertisements` fonctionne).
+#
+# 2. CiliumBGPAdvertisement
+#    CE QU'ON ANNONCE. Pour l'objectif de la phase 2 : le podCIDR de chaque noeud.
+#    Le pool LoadBalancer viendra s'ajouter ici plus tard (2eme advertisement,
+#    ou 2eme entree) — ne l'ajoute pas tant que le podCIDR n'est pas valide
+#    cote fabric : une seule variable a la fois.
+#
+# A CHERCHER AVANT D'ECRIRE :
+#   kubectl api-resources | grep -i bgp        -> les apiVersion exactes
+#   kubectl explain ciliumbgppeerconfig.spec   -> les champs disponibles
+#
+# QUESTION A TRANCHER : quel type d'advertisement pour le podCIDR ? Cilium en
+# propose plusieurs (PodCIDR, CiliumPodIPPool, Service...). Lequel correspond a
+# ton `ipam.mode: kubernetes` cote values Helm ?

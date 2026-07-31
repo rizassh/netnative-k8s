@@ -291,3 +291,155 @@ et documentées — c'est le vrai acquis de la soirée.
   jamais `latest`) ; images **préchargées** via archive mono-plateforme, jamais pullées
   depuis les nœuds ; namespace dédié `netlab` déclaré **dans le manifest** et non créé
   en impératif.
+
+## 2026-08-01 — Phase 2 (outillage : Makefile fiabilisé, préchargement d'images, réorg)
+Session dense côté **infrastructure du lab**, pas côté BGP : le workload de test tourne
+enfin correctement, et surtout le lab se remonte **de zéro en une commande**. Une panne
+d'installation Cilium a révélé un défaut de conception réel (dépendance d'ordre implicite)
+qui est maintenant corrigé.
+
+> ⚠️ **À RELIRE À TÊTE REPOSÉE** — cette session a été menée en grande partie avec
+> l'assistance de Claude Code, et plusieurs fichiers ont été écrits par lui. Je ne
+> maîtrise pas encore tout ce qui suit. Points à reprendre et à savoir réexpliquer
+> **avant l'entretien** (liste en fin d'entrée).
+
+- **Fait — `netshoot-load` réparé puis remplacé** :
+  - Les 4 bugs listés le 28/07 étaient réels : `:` au lieu de `;` (le shell lisait
+    `TAR=… docker save …`, c.-à-d. une affectation d'environnement pour une seule
+    commande → `TAR` vide ensuite) ; `mktemp` sans 3 `X` consécutifs ; chaînage en `;`
+    masquant les échecs derrière le code de retour du `rm -f` final ; `docker pull`
+    inconditionnel. Corrigés, puis la cible a été **généralisée** (voir plus bas).
+  - Leçon Make retenue : un commentaire en **colonne 0** est un commentaire *Make*
+    (invisible) ; indenté par une tabulation, il devient un commentaire *shell* et
+    s'affiche à chaque exécution. Vérifiable avec `make -n`.
+
+- **Fait — manifest du workload complété** (`netshoot-daemonset.yaml`) :
+  - `Namespace netlab` **déclaré dans le fichier**, en premier document (`apply` traite
+    les documents dans l'ordre). Le `apply` a d'ailleurs émis un warning
+    `missing kubectl.kubernetes.io/last-applied-configuration` : la trace de la création
+    impérative précédente. Dérive soldée.
+  - **Deux DaemonSets** `netshoot-a` / `netshoot-b` au lieu d'un seul. Raison : un
+    DaemonSet donne **un pod par nœud**, donc aucune paire intra-nœud — le contrôle
+    négatif de l'objectif B était structurellement impossible. Les deux `selector`
+    portent `app: netshoot` **plus** un label `pair: a|b` : avec `app` seul des deux
+    côtés, chaque DaemonSet adopterait les pods de l'autre. Le `selector` d'un
+    DaemonSet est **immuable** → une erreur de labels impose `delete` puis `apply`.
+  - Résultat : **4 pods Running**, 2 par worker (`10.244.1.133`/`10.244.1.190` sur
+    worker, `10.244.2.133`/`10.244.2.5` sur worker2).
+
+- **Fait — réorganisation de `k8s/`** selon le critère *« qui applique le fichier ? »* :
+  - `k8s/bootstrap/` : `kind-config.yaml`, `cilium-values.yaml`, `images.txt` — ce qui
+    **crée** le cluster. Ne pourra **jamais** être géré par ArgoCD (ça existe avant le
+    cluster, ou avant le CNI dont Argo dépend pour tourner).
+  - `k8s/manifests/` : objets K8s appliqués par `kubectl` aujourd'hui, par **ArgoCD**
+    en phase 3. C'est cette frontière qui rendra l'app-of-apps possible sans
+    retoucher l'arborescence.
+  - Les variables de chemin en tête de Makefile ont absorbé le déplacement en 3 lignes.
+
+- **PANNE — `cilium-install` échoue une fois la fabric allumée** :
+  - Symptôme : `ImagePullBackOff` sur **tous** les pods Cilium de `worker`/`worker2`,
+    alors que ceux du control-plane tournent. `dial tcp 32.193.160.199:443: i/o timeout`
+    vers quay.io.
+  - Cause : c'est la **Découverte 1 du 28/07 appliquée à Cilium lui-même**. `fabric-up`
+    fait remplacer la route par défaut des workers par `default via 10.1.1.1 dev eth1` ;
+    la fabric n'a aucun NAT, donc plus d'egress, donc kubelet ne pull plus rien.
+    Le 24/07 ça passait uniquement parce que la fabric était **éteinte** au moment de
+    l'install. Le vrai défaut : une **dépendance d'ordre implicite**, ni documentée ni
+    appliquée par le Makefile.
+  - À noter : `fabric-down` **ne restaure pas** la route par défaut d'origine (le nœud
+    se retrouve sans `default` du tout) — on ne peut donc pas s'en sortir en éteignant
+    la fabric, il faudrait recréer le cluster.
+
+- **Investigation — pourquoi une image épinglée par digest ne peut PAS être préchargée** :
+  - `docker save` d'une référence à digest produit une archive **sans nom**
+    (`"RepoTags": null`) ; `kind load` l'importe (exit 0, **aucun message**) mais
+    containerd l'enregistre sous un nom inventé : `import-2026-07-31@sha256:8bc32d97…`.
+    Kubelet, qui réclame `quay.io/cilium/cilium:v1.19.6@sha256:0df5b27…`, ne l'y
+    retrouve jamais et repart en pull réseau.
+  - Racine : c'est le prolongement de la Découverte 2. `docker save --platform` produit
+    une archive **mono-plateforme**, dont le digest de manifeste **diffère** par
+    construction de celui de l'index multi-plateforme épinglé.
+  - **Parade validée expérimentalement** : `docker pull` **par digest** (contenu vérifié
+    à l'octet près) → `docker tag` en `nom:tag` → `docker save` du **tag** → l'archive
+    porte `"RepoTags":["quay.io/cilium/operator-generic:v1.19.6"]` et containerd
+    l'enregistre sous ce nom. **L'épinglage ne disparaît pas : il se déplace** du
+    manifeste Kubernetes vers l'étape de préchargement.
+  - Corollaire obligatoire : le chart doit cesser d'émettre des références à digest,
+    sinon kubelet demande un nom absent → `useDigest: false` sur `image`,
+    `operator.image` et `envoy.image` dans `cilium-values.yaml`.
+
+- **Fait — `images-preload`, cible générique** (remplace `netshoot-load`) :
+  - Liste des images dans **`k8s/bootstrap/images.txt`** (4 images : cilium,
+    operator-generic, cilium-envoy, netshoot), épinglées par digest, avec le
+    raisonnement en tête de fichier et la commande `helm template … | grep image:`
+    pour retrouver les digests au prochain bump de version. Sortir la liste du
+    Makefile prépare la phase 4 (Prometheus, Grafana).
+  - La cible **saute toute image déjà présente** sur les 3 nœuds : **42 s** à froid,
+    **0,66 s** en régime établi. Bug attrapé à l'usage : containerd normalise
+    `nicolaka/netshoot:v0.16` en `docker.io/nicolaka/netshoot:v0.16`, donc la
+    comparaison exacte ne matchait jamais et netshoot était rechargé à chaque appel.
+  - `cilium-install` et `workload-up` en **dépendent** → l'installation est désormais
+    **insensible à l'ordre** des cibles.
+
+- **Fait — cibles `lab-up` / `lab-down`** : l'ordre `cluster-up → fabric-up →
+  cilium-install → workload-up` est maintenant **encodé** et non plus seulement
+  documenté (les conteneurs kind doivent exister avant clab, qui les référence par
+  leur nom). C'est la correction du défaut de fond révélé par la panne.
+
+- **Validé** : 3 nœuds `Ready`, `cilium-status` → image `quay.io/cilium/cilium:v1.19.6`
+  (release, pas `:latest`), `Routing: Network: Native`, 4 pods netshoot `Running`.
+
+- **Fait — squelettes BGP créés** (`k8s/manifests/bgp/`, **vides, à remplir moi-même**) :
+  `bgp-common.yaml` (PeerConfig + Advertisement, communs aux deux peerings),
+  `bgp-leaf1.yaml` et `bgp-leaf2.yaml` (un ClusterConfig + un NodeConfigOverride chacun).
+
+- **Décision d'archi — il faut DEUX `CiliumBGPClusterConfig`** :
+  `peerAddress` vit dans le `ClusterConfig` et diffère d'un nœud à l'autre
+  (`10.1.1.1` vs `10.1.2.1`) ; or le `nodeSelector` est au niveau du `spec` et
+  s'applique à **toutes** les `bgpInstances`. Deux instances dans un seul objet
+  feraient donc que chaque nœud tenterait de joindre le leaf de l'autre, sans route
+  pour y aller. Et `CiliumBGPNodeConfigOverride` **ne surcharge pas** `peerAddress`
+  (seulement `routerID`, adresse locale de session, ports). D'où : deux ClusterConfig
+  à `nodeSelector` disjoints, mais **un seul** PeerConfig et un seul Advertisement,
+  référencés par les deux.
+
+- **Décision actée — un ASN par nœud** (et non un ASN unique pour le cluster).
+  Justification RFC 7938 (un ASN privé par équipement) — mais l'argument **décisif**
+  est ailleurs : avec un ASN partagé par les deux workers, le podCIDR de `worker`
+  annoncé à leaf1 remonterait aux spines puis redescendrait vers `worker2`, qui le
+  **rejetterait** — son propre ASN figurant dans l'AS-path, la prévention de boucle
+  eBGP le supprime. Le pod↔pod inter-nœud ne fonctionnerait pas, sauf à bricoler un
+  `allowas-in`. Un ASN par nœud supprime le problème à la racine. *(À vérifier
+  moi-même en observant l'AS-path sur spine1 une fois le peering monté.)*
+
+- **Bloqué** : —
+- **Prochaine étape** :
+  1. **Relire et comprendre** les fichiers écrits cette session (liste ci-dessous).
+  2. Poser le label `fabric.leaf: leaf1|leaf2` dans `kind-config.yaml` (champ `labels`
+     par entrée de `nodes` ; l'ordre des entrées détermine le nom du nœud). Attention :
+     les labels sont posés à l'**enregistrement** du nœud → recréer le cluster
+     (`make lab-down && make lab-up`), ce qui validera la chaîne au passage.
+  3. **Objectif B** — la séquence de mesure « avant BGP », enfin possible avec les
+     4 pods : (a) vérifier les IP, (b) ping **intra-nœud** → doit réussir (contrôle
+     négatif), (c) ping **inter-nœud** → doit échouer, (d) `ip route` sur worker →
+     absence de `10.244.2.0/24`. **Garder les sorties dans `docs/`**, c'est le « avant ».
+  4. Écrire `bgp-common.yaml` puis `bgp-leaf1.yaml` **seul** ; monter et valider ce
+     premier peering (`show bgp summary` sur leaf1) avant d'écrire `bgp-leaf2.yaml`.
+     Ne pas oublier le côté FRR : `clab/configs/leaf1/frr.conf` ne connaît pas encore
+     ce voisin.
+
+- **À RELIRE / REFAIRE MOI-MÊME (dette de compréhension)** :
+  1. `Makefile`, cible `images-preload` : la boucle `while read` en shell, pourquoi
+     tout le corps est **un seul** shell (les `\`), le rôle de `set -e`, et le `$$`
+     de Make. Objectif : savoir la réécrire de mémoire.
+  2. Le raisonnement **digest vs tag** en entier — c'est le point le plus subtil de la
+     session et **le compromis que je devrai défendre en entretien** : mes manifestes
+     ne portent plus de digest, l'épinglage vit dans `images.txt`. Savoir dire pourquoi
+     (les nœuds n'atteignent aucun registre, donc la reproductibilité s'ancre au
+     préchargement).
+  3. `k8s/manifests/workloads/netshoot-daemonset.yaml` : pourquoi deux DaemonSets,
+     pourquoi les labels doivent être disjoints, pourquoi pas de `hostNetwork`.
+  4. La distinction `k8s/bootstrap/` vs `k8s/manifests/` et son lien avec ArgoCD.
+  5. Refaire **à la main** le diagnostic de la panne : `kubectl describe pod` →
+     `docker exec <worker> ip route` → conclusion. C'est un exercice de dépannage
+     typique en entretien.

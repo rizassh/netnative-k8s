@@ -4,7 +4,11 @@ name: l3bgp-cluster
 nodes:
   - role: control-plane
   - role: worker
+    labels:
+        fabric: leaf1
   - role: worker
+    labels:
+        fabric: leaf2
 networking:
   # the default CNI will not be installed
   disableDefaultCNI: true

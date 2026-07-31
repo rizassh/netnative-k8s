@@ -1,0 +1,16 @@
+# Peering complet du cote leaf2 : l3bgp-cluster-worker2 <-> leaf2 (AS65012).
+# Lien fabric : leaf2:eth3 <-> worker2:eth1, 10.1.2.0/24.
+#
+# Meme structure que bgp-leaf1.yaml — ecris celui-la EN SECOND, une fois le
+# premier peering monte et valide (`show bgp summary` sur leaf1). Debugger deux
+# sessions a la fois coute bien plus cher que deux fois une session.
+#
+# A ECRIRE ICI :
+#
+# 1. CiliumBGPClusterConfig  -> nodeSelector ne matchant QUE worker2
+# 2. CiliumBGPNodeConfigOverride -> nomme d'apres le noeud, IP fabric 10.1.2.10
+#
+# PIEGE : si les deux nodeSelector se recouvrent, un noeud recoit deux instances
+# BGP et tente de joindre le leaf de l'autre — sans route pour y aller. Symptome :
+# une session Established et une session bloquee en Active/Connect. Verifie tes
+# selecteurs avant d'accuser FRR.
