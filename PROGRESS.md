@@ -443,3 +443,65 @@ qui est maintenant corrigé.
   5. Refaire **à la main** le diagnostic de la panne : `kubectl describe pod` →
      `docker exec <worker> ip route` → conclusion. C'est un exercice de dépannage
      typique en entretien.
+
+## 2026-08-03 — Phase 2 (objectif B capturé : le « avant BGP »)
+Session courte et ciblée : figer par écrit l'état du pod↔pod **avant** d'activer le BGP.
+Ce point de comparaison disparaît dès que le premier peering monte — d'où l'intérêt de
+le capturer maintenant, dans `docs/avant-bgp.md`.
+
+- **Fait — labels `fabric` confirmés en place** (étape restée non consignée le 01/08) :
+  `kind-config.yaml` porte `labels: {fabric: leaf1|leaf2}` par entrée `worker`, et
+  `kubectl get nodes -L fabric` les montre bien sur les nœuds. C'est ce label que les
+  `nodeSelector` des deux `CiliumBGPClusterConfig` utiliseront — pas
+  `kubernetes.io/hostname`, pour ne pas coder un nom de nœud en dur.
+
+- **Fait — objectif B mesuré et documenté** (`docs/avant-bgp.md`), dans l'ordre :
+  1. IP des 4 pods : `10.244.1.x` sur `worker`, `10.244.2.x` sur `worker2` → chaque nœud
+     a bien reçu son `/24` découpé dans `10.244.0.0/16`.
+  2. Ping **intra-nœud** (les deux pods de `worker2`) → **0% loss**. C'est le
+     **contrôle négatif** : il prouve que le CNI fonctionne, donc que l'échec suivant
+     est un problème de *routage inter-nœud* et non un cluster cassé.
+  3. Ping **inter-nœud** (`worker2` → `10.244.1.65`) → **échec**, comme attendu.
+  4. `ip route` sur `worker` : le nœud connaît `10.1.1.0/24` (lien fabric), sa default
+     via `10.1.1.1`, et son **propre** `10.244.1.0/24` via `cilium_host` — mais **aucune
+     route vers `10.244.2.0/24`**. C'est exactement le trou laissé volontairement par
+     `autoDirectNodeRoutes: false` le 24/07, et c'est ce trou que le BGP doit combler.
+
+- **Découverte 3 — un redémarrage des conteneurs kind détache silencieusement les
+  nœuds de la fabric.** La première capture de l'objectif B montrait
+  `default via 172.18.0.1 dev eth0` et **pas d'`eth1` du tout** sur les deux workers,
+  alors que les conteneurs `clab-leaf-spine-*` tournaient.
+  - **Cause** : containerlab injecte `eth1` (nœud `ext-container`) dans le **netns du
+    conteneur au moment du `deploy`**. Un redémarrage du conteneur kind repart sur un
+    netns neuf : le veth est détruit et containerlab ne le recrée pas. Indice concordant :
+    `RESTARTS 1` sur les 4 pods netshoot.
+  - **Symptôme trompeur** : côté Kubernetes tout paraît sain (3 nœuds `Ready`, pods
+    `Running`, Cilium OK). Le détachement ne se voit qu'en `ip addr` / `ip route` sur le
+    nœud. Un ping inter-nœud échoue alors pour la *mauvaise* raison, ce qui invaliderait
+    la démonstration.
+  - **Parade** : rejouer `make fabric-down && make fabric-up` après tout redémarrage des
+    conteneurs kind. Revalidé ensuite : `eth1` = `10.1.1.10/24` sur `worker`,
+    `10.1.2.10/24` sur `worker2`, default via le leaf. Section 4 de la doc recapturée.
+  - À traiter plus tard : le Makefile ne détecte pas cet état. Une cible de
+    vérification (`lab-check` : présence d'`eth1` + ping leaf → nœud) éviterait de
+    débugger un peering BGP qui ne peut structurellement pas monter.
+
+- **Bloqué** : —
+- **Prochaine étape** :
+  1. Écrire `bgp-common.yaml` (`CiliumBGPPeerConfig` + `CiliumBGPAdvertisement`).
+     Points à trancher : le type d'advertisement correspondant à `ipam.mode: kubernetes`
+     (le podCIDR vient de `node.spec.podCIDR`, découpé par `kube-controller-manager`) ;
+     et le fait que le PeerConfig référence l'Advertisement par **label selector**, pas
+     par nom — un selector qui ne matche rien donne une session Established annonçant
+     **zéro** préfixe.
+  2. Puis `bgp-leaf1.yaml` **seul**, plus le voisin correspondant dans
+     `clab/configs/leaf1/frr.conf` (il n'y est pas encore). Valider avec
+     `show bgp summary` sur leaf1 avant d'écrire `bgp-leaf2.yaml`.
+  3. Une fois les deux peerings montés : rejouer la séquence de `docs/avant-bgp.md`
+     pour produire le « après » (ping inter-nœud OK, route `10.244.2.0/24` apprise
+     par BGP), et vérifier l'AS-path sur spine1 pour confirmer la décision
+     « un ASN par nœud » du 01/08.
+
+- **Décisions actées** : le « avant » est archivé dans `docs/` et ne sera plus régénéré ;
+  toute mesure de démo doit être précédée d'une vérification de l'attache fabric
+  (Découverte 3).
