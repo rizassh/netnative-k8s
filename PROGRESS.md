@@ -505,3 +505,94 @@ le capturer maintenant, dans `docs/avant-bgp.md`.
 - **Décisions actées** : le « avant » est archivé dans `docs/` et ne sera plus régénéré ;
   toute mesure de démo doit être précédée d'une vérification de l'attache fabric
   (Découverte 3).
+
+## 2026-08-04 — Phase 2 (LE peering BGP Cilium ↔ fabric est monté) 🎯
+**L'objectif central de la phase 2 est atteint** : la fabric leaf-spine route nativement
+le trafic pod↔pod, appris par eBGP. Le trou volontairement laissé le 24/07
+(`autoDirectNodeRoutes: false`) est comblé par le protocole, pas par un raccourci L2.
+
+- **Fait — `k8s/manifests/bgp/` écrit et appliqué** (3 fichiers) :
+  - `bgp-common.yaml` : `CiliumBGPPeerConfig` + `CiliumBGPAdvertisement`, communs aux
+    deux peerings. Choix `advertisementType: PodCIDR` (le préfixe vient de
+    `node.spec.podCIDR`, découpé par `kube-controller-manager` — c'est ce qui correspond
+    à `ipam.mode: kubernetes` ; `CiliumPodIPPool` aurait visé un IPAM géré par Cilium).
+  - `bgp-leaf1.yaml` / `bgp-leaf2.yaml` : un `CiliumBGPClusterConfig` +
+    un `CiliumBGPNodeConfigOverride` chacun, `nodeSelector` disjoints sur le label
+    `fabric: leaf1|leaf2`.
+  - Côté FRR : `neighbor` + `activate` ajoutés dans `clab/configs/leaf1|leaf2/frr.conf`.
+
+- **Trouvaille — `transport.sourceInterface: eth1` résout la question ouverte du 24/07.**
+  On désigne l'**interface** au lieu d'une IP locale en dur : `eth1` porte le même nom sur
+  les deux workers, donc **une seule ligne dans l'objet commun** couvre les deux peerings.
+  `CiliumBGPNodeConfigOverride.peers[].localAddress` devient inutile — l'override ne garde
+  qu'une raison d'exister : le `routerID`.
+  - **Piège documenté** : si `eth1` est absente, Cilium ne remonte **aucune erreur** et
+    retombe sur l'auto-détection → session sourcée en `172.18.0.x`, refusée par le leaf.
+    Or `eth1` disparaît au redémarrage des conteneurs kind (Découverte 3). Conclusion :
+    devant une session bloquée en `Active`, vérifier `ip addr` **avant** la config BGP.
+
+- **`routerID` = l'IP fabric du nœud** (`10.1.1.10` / `10.1.2.10`), faute de loopback sur
+  les nœuds kind. Le router-id n'a pas besoin d'être joignable : c'est un identifiant
+  unique sur 32 bits. Ce qui le rend stable n'est pas le *type* d'interface mais le fait
+  qu'il soit **déclaré** dans `clab/leaf-spine.clab.yml` (réappliqué à l'identique à
+  chaque `deploy`), à l'inverse de l'InternalIP que le bridge Docker réattribue.
+  **Limite assumée** : c'est une adresse d'interface — en dual-homing ou après
+  réadressage du lien, l'identité BGP changerait. Acceptable car le design est
+  `1 nœud = 1 leaf`.
+
+- **Plan d'ASN figé** : `6500x` spines, `6501x` leaves, `65NNN` nœuds kind avec N répété
+  = index du nœud (`worker` = 65111, `worker2` = 65222). Le chiffre répété rend le nœud
+  identifiable d'un coup d'œil dans un `show bgp summary`. Choix assumé : les ASN de
+  nœuds ne se **déduisent pas** de ceux des leaves, ils s'identifient visuellement.
+
+- **Validé — mesures dans `docs/apres-bgp.md`, en miroir de `avant-bgp.md`** :
+  1. Session `established` : `65111 ↔ 65011`, `Received 7 / Advertised 1`.
+  2. Préfixe annoncé : `10.244.1.0/24` **next-hop `10.1.1.10`** (l'IP fabric, pas
+     `172.18.0.x`) → confirme que **le next-hop suit la source de session**, donc
+     `sourceInterface` règle deux problèmes d'un coup.
+  3. **Traceroute pod → pod inter-nœud** : `cilium_host` → `10.1.1.1` (leaf1) →
+     `10.0.0.0` (spine1) → `10.0.0.3` (leaf2) → `10.1.2.10` (worker2) → pod.
+     **C'est LA capture de la phase 2** : le trafic Kubernetes traverse réellement la
+     fabric, saut par saut. Avec `autoDirectNodeRoutes: true`, ce traceroute aurait
+     montré un seul saut par le bridge Docker et n'aurait rien démontré.
+  4. **ECMP jusqu'aux pods** : sur leaf1, `10.244.2.0/24` a deux chemins valides
+     (`*>` via spine1, `*=` via spine2). C'est `bgp bestpath as-path multipath-relax`
+     qui l'autorise — sans lui, des AS-path différents interdiraient le multipath.
+  5. **La décision « un ASN par nœud » est prouvée** : AS-path sur spine1 =
+     `65011 65111` et `65012 65222`. Aucun worker ne voit son propre ASN dans l'AS-path
+     de l'autre. Avec un ASN partagé, la prévention de boucle eBGP aurait fait rejeter
+     le préfixe distant. Vérification promise le 01/08, faite.
+  6. Signature visible jusque dans le `ping` : TTL **63** en intra-nœud contre **58**
+     en inter-nœud — les 5 sauts de la fabric.
+
+- **Comportement à savoir expliquer** : `Received 7` côté Cilium, mais **aucune route
+  `10.244.2.0/24` dans la table du noyau** de `worker`. Le BGP control plane de Cilium
+  **annonce**, il ne programme pas les routes reçues dans le datapath. Le trafic sort
+  par la `default via 10.1.1.1` et c'est leaf1 qui connaît le chemin. Contre-intuitif,
+  et c'est une bonne question d'entretien.
+
+- **Rappel FRR** : `no bgp ebgp-requires-policy` (déjà présent depuis la phase 1) est ce
+  qui neutralise le comportement RFC 8212 — sans lui, un voisin eBGP sans politique
+  n'annonce ni n'accepte rien : session Established, zéro préfixe. Même symptôme qu'un
+  label selector qui ne matche rien, cause totalement différente. Savoir distinguer les
+  deux.
+
+- **Bloqué** : —
+- **Prochaine étape** :
+  1. Compléter `docs/apres-bgp.md` : il ne contient aujourd'hui que les pings et la table
+     de routage. Y ajouter les **preuves BGP** (`show bgp summary` sur leaf1 **et leaf2**,
+     `show bgp ipv4 unicast` montrant l'ECMP et l'AS-path côté spine1, `cilium-dbg bgp
+     peers` / `routes advertised`, et surtout le **traceroute**). Sans elles, la doc
+     montre que ça marche mais pas *pourquoi ni par où*.
+  2. **Pool LoadBalancer** : `CiliumLoadBalancerIPPool` + un **2ème
+     `CiliumBGPAdvertisement`** de type `Service`. C'est là que le lien par **label
+     selector** du PeerConfig prend son sens : choisir d'annoncer podCIDR seul, pool
+     seul, ou les deux. Valider avec un Service `type: LoadBalancer` joignable depuis
+     un point de la fabric.
+  3. Ensuite seulement, phase 3 (GitOps ArgoCD) — la frontière
+     `k8s/bootstrap/` vs `k8s/manifests/` posée le 01/08 est faite pour ça.
+
+- **Dette de compréhension (nouvelle)** : les commentaires de `bgp-common.yaml` et
+  `bgp-leaf1.yaml` ont été rédigés par Claude Code à partir de mes décisions. Le contenu
+  est vérifié (les affirmations sur le next-hop et l'AS-path ont été prouvées ci-dessus),
+  mais **je dois pouvoir les réexpliquer sans les lire**. S'ajoute à la liste du 01/08.

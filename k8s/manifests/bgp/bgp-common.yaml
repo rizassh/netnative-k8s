@@ -1,26 +1,71 @@
 # Ce qui est IDENTIQUE aux deux peerings (worker<->leaf1 et worker2<->leaf2).
-# Ces objets sont references PAR NOM depuis les ClusterConfig, donc ecrits une
-# seule fois et reutilises des deux cotes.
+# Ecrit une fois, reference par les deux CiliumBGPClusterConfig.
 #
-# A ECRIRE ICI :
-#
-# 1. CiliumBGPPeerConfig
-#    Le "profil" d'une session : timers, address families, graceful restart,
-#    eventuelles politiques d'import/export. Tout ce qui ne depend NI du noeud
-#    NI du leaf en face.
-#    C'est aussi lui qui pointe vers l'Advertisement ci-dessous (par label,
-#    pas par nom — regarde comment `families[].advertisements` fonctionne).
-#
-# 2. CiliumBGPAdvertisement
-#    CE QU'ON ANNONCE. Pour l'objectif de la phase 2 : le podCIDR de chaque noeud.
-#    Le pool LoadBalancer viendra s'ajouter ici plus tard (2eme advertisement,
-#    ou 2eme entree) — ne l'ajoute pas tant que le podCIDR n'est pas valide
-#    cote fabric : une seule variable a la fois.
-#
-# A CHERCHER AVANT D'ECRIRE :
-#   kubectl api-resources | grep -i bgp        -> les apiVersion exactes
-#   kubectl explain ciliumbgppeerconfig.spec   -> les champs disponibles
-#
-# QUESTION A TRANCHER : quel type d'advertisement pour le podCIDR ? Cilium en
-# propose plusieurs (PodCIDR, CiliumPodIPPool, Service...). Lequel correspond a
-# ton `ipam.mode: kubernetes` cote values Helm ?
+# CiliumBGPPeerConfig  = COMMENT on parle au voisin (profil de session).
+# CiliumBGPAdvertisement = CE QU'ON annonce.
+# Les deux ne se connaissent PAS par leur nom : le lien se fait par label
+# selector (voir families[].advertisements plus bas).
+
+apiVersion: cilium.io/v2
+kind: CiliumBGPPeerConfig
+metadata:
+  name: cilium-peer
+spec:
+  # Valeurs par defaut de BGP, ecrites explicitement pour que ce qui est
+  # negocie soit lisible ici. Convention : hold = 3 x keepalive.
+  timers:
+    holdTimeSeconds: 90
+    keepAliveTimeSeconds: 30
+
+  # IP source de la session = celle d'eth1, l'interface fabric.
+  # Sans ca, la session partirait de l'InternalIP du noeud (172.18.0.x, attribuee
+  # par le bridge Docker et INSTABLE : elle change de place au redemarrage) et
+  # leaf1 refuserait un voisin inconnu.
+  # Designer l'interface plutot qu'une IP en dur : eth1 porte le meme nom sur les
+  # deux workers, donc une seule ligne ici couvre les deux peerings — pas besoin
+  # de localAddress dans les CiliumBGPNodeConfigOverride.
+  # Effet induit : le next-hop annonce suit la source de session, donc le podCIDR
+  # arrive sur leaf1 avec un next-hop qu'il joint en direct (10.1.1.10).
+  # PIEGE : si eth1 est absente, Cilium ne remonte AUCUNE erreur et retombe sur
+  # l'auto-detection => session sourcee en 172.18.0.x, bloquee en Active/Connect.
+  # Or eth1 disparait au redemarrage des conteneurs kind (cf. PROGRESS, decouverte
+  # 3) : verifier `ip addr` sur le noeud AVANT de suspecter la config BGP.
+  transport:
+      sourceInterface: eth1
+
+  # Le leaf conserve les routes vers les pods pendant un redemarrage de l'agent
+  # Cilium, au lieu de trouer le trafic. A verifier cote FRR : la capacite doit
+  # etre NEGOCIEE (`show bgp neighbor`), sinon c'est declaratif et sans effet.
+  gracefulRestart:
+    enabled: true
+    restartTimeSeconds: 15
+
+  families:
+    - afi: ipv4
+      safi: unicast
+      # Label selector, PAS un nom d'objet (meme mecanique qu'un Service qui
+      # trouve ses pods). Si rien ne matche : session Established et ZERO prefixe
+      # annonce, sans aucune erreur. Selector volontairement explicite et non vide
+      # ({} matcherait tout, y compris le futur advertisement du pool LoadBalancer).
+      advertisements:
+        matchLabels:
+            advertisement: podcidr
+
+---
+
+apiVersion: cilium.io/v2
+kind: CiliumBGPAdvertisement
+metadata:
+  name: bgp-advertisements
+  # C'est ce label — et non le nom — que le PeerConfig selectionne.
+  labels:
+    advertisement: podcidr
+spec:
+  advertisements:
+    # PodCIDR = le prefixe attribue au noeud par kube-controller-manager dans
+    # node.spec.podCIDR (un /24 decoupe dans 10.244.0.0/16). C'est le type qui
+    # correspond a ipam.mode: kubernetes, cf. k8s/bootstrap/cilium-values.yaml.
+    # CiliumPodIPPool aurait vise un IPAM gere par Cilium, qu'on n'utilise pas.
+    # Le pool LoadBalancer viendra plus tard, dans un 2eme Advertisement : une
+    # seule variable a la fois tant que le podCIDR n'est pas valide cote fabric.
+    - advertisementType: "PodCIDR"

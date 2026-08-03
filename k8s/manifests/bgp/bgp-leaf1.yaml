@@ -1,29 +1,71 @@
-# Peering complet du cote leaf1 : l3bgp-cluster-worker <-> leaf1 (AS65011).
+# Peering du cote leaf1 : l3bgp-cluster-worker <-> leaf1 (AS65011).
 # Lien fabric : leaf1:eth3 <-> worker:eth1, 10.1.1.0/24.
 #
-# Un fichier par peering parce que `peerAddress` differe d'un noeud a l'autre et
-# n'est PAS surchargeable par NodeConfigOverride : il faut donc bien deux
-# CiliumBGPClusterConfig avec des nodeSelector disjoints.
-#
-# A ECRIRE ICI :
-#
-# 1. CiliumBGPClusterConfig
-#    - nodeSelector : ne doit matcher QUE worker. Utilise le label pose dans
-#      k8s/bootstrap/kind-config.yaml (pas kubernetes.io/hostname : on ne code
-#      pas un nom de noeud en dur).
-#    - bgpInstances[].localASN : cf. la decision ASN unique vs ASN par noeud.
-#    - bgpInstances[].peers[] : l'adresse de leaf1 sur le lien, son ASN, et le
-#      peerConfigRef vers le PeerConfig de bgp-common.yaml.
-#
-# 2. CiliumBGPNodeConfigOverride
-#    Le nom de l'objet doit correspondre au NOM DU NOEUD (c'est comme ca que
-#    Cilium l'associe — verifie-le).
-#    - routerID : identite BGP stable. Surtout pas une InternalIP (172.18.0.x) :
-#      elles changent de place au redemarrage du bridge Docker.
-#    - l'adresse locale de session : doit etre l'IP fabric du noeud, sinon la
-#      session partirait de 172.18.0.x et leaf1 refuserait un voisin inconnu.
-#      Effet induit a comprendre : le next-hop annonce suit la source de session,
-#      donc le podCIDR sera annonce avec un next-hop que leaf1 sait joindre en direct.
-#
-# COTE FABRIC : rien dans clab/configs/leaf1/frr.conf ne prevoit ce voisin
-# aujourd'hui. Le peering ne montera pas tant que les deux cotes ne sont pas ecrits.
+# UN FICHIER PAR PEERING : peerAddress vit dans le ClusterConfig et differe d'un
+# noeud a l'autre (10.1.1.1 vs 10.1.2.1), or nodeSelector est au niveau du spec et
+# s'applique a TOUTES les bgpInstances. Deux instances dans un seul objet feraient
+# donc que chaque noeud tenterait de joindre le leaf de l'autre, sans route pour y
+# aller. Et CiliumBGPNodeConfigOverride ne surcharge PAS peerAddress.
+
+apiVersion: cilium.io/v2
+kind: CiliumBGPClusterConfig
+metadata:
+  # Ressource cluster-scoped : le nom doit differer de celui de bgp-leaf2.yaml,
+  # sinon le 2eme apply ecrase le 1er au lieu d'ajouter un peering.
+  name: cilium-bgp-leaf1
+spec:
+  # Label pose dans k8s/bootstrap/kind-config.yaml, et non kubernetes.io/hostname :
+  # on ne code pas un nom de noeud en dur. Doit rester DISJOINT de celui de leaf2 —
+  # un recouvrement donnerait deux instances BGP au meme noeud.
+  nodeSelector:
+    matchLabels:
+      fabric: leaf1
+  bgpInstances:
+  - name: "instance-65111"
+    # Un ASN PAR NOEUD (et non un ASN unique de cluster). Plan d'ASN du lab :
+    #   6500x = spines (65001, 65002)
+    #   6501x = leaves (65011, 65012)
+    #   65NNN = noeud kind, N repete = index du noeud (worker=65111, worker2=65222)
+    # Le chiffre repete rend le noeud identifiable d'un coup d'oeil dans un
+    # `show bgp summary` cote fabric.
+    # Raison decisive : avec un ASN partage par les deux workers, le podCIDR de
+    # worker remonterait aux spines puis redescendrait vers worker2, qui le
+    # rejetterait (son propre ASN dans l'AS-path => prevention de boucle eBGP).
+    # Le pod<->pod inter-noeud ne marcherait pas, sauf a bricoler un allowas-in.
+    localASN: 65111
+    # Port d'ECOUTE de Cilium, pas le port de destination du voisin. Sans ce
+    # champ, Cilium ne ferait qu'initier la session ; avec, FRR peut aussi
+    # l'initier — comportement BGP classique des deux cotes.
+    localPort: 179
+    peers:
+    - name: "leaf1"
+      peerASN: 65011
+      # Adresse de leaf1 sur le lien fabric (eth3 cote leaf).
+      peerAddress: 10.1.1.1
+      # Profil de session commun aux deux peerings, cf. bgp-common.yaml.
+      peerConfigRef:
+        name: "cilium-peer"
+
+---
+
+apiVersion: cilium.io/v2
+kind: CiliumBGPNodeConfigOverride
+metadata:
+  # Le nom de l'objet DOIT etre le nom du noeud : c'est comme ca que Cilium
+  # l'associe.
+  name: l3bgp-cluster-worker
+spec:
+  bgpInstances:
+    # Cle de jointure avec le ClusterConfig ci-dessus : ce nom doit correspondre
+    # EXACTEMENT a celui de l'instance. S'il ne matche pas, l'override ne
+    # s'applique a rien — silencieusement, sans erreur ni avertissement.
+    - name: "instance-65111"
+      # Identite BGP stable. Ce n'est qu'un identifiant unique sur 32 bits : il
+      # n'a pas besoin d'etre joignable. On prend l'IP fabric parce qu'elle est
+      # DECLAREE dans clab/leaf-spine.clab.yml (donc reappliquee a l'identique a
+      # chaque deploy), contrairement a l'InternalIP 172.18.0.x que Cilium
+      # utiliserait par defaut et que le bridge Docker reattribue au redemarrage.
+      # LIMITE ASSUMEE : c'est une adresse d'interface, pas une loopback — en
+      # dual-homing ou apres readressage du lien, l'identite BGP changerait.
+      # Acceptable ici car le design est 1 noeud = 1 leaf.
+      routerID: "10.1.1.10"

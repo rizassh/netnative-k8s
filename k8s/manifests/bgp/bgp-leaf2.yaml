@@ -1,16 +1,50 @@
-# Peering complet du cote leaf2 : l3bgp-cluster-worker2 <-> leaf2 (AS65012).
+# Peering du cote leaf2 : l3bgp-cluster-worker2 <-> leaf2 (AS65012).
 # Lien fabric : leaf2:eth3 <-> worker2:eth1, 10.1.2.0/24.
 #
-# Meme structure que bgp-leaf1.yaml — ecris celui-la EN SECOND, une fois le
-# premier peering monte et valide (`show bgp summary` sur leaf1). Debugger deux
-# sessions a la fois coute bien plus cher que deux fois une session.
-#
-# A ECRIRE ICI :
-#
-# 1. CiliumBGPClusterConfig  -> nodeSelector ne matchant QUE worker2
-# 2. CiliumBGPNodeConfigOverride -> nomme d'apres le noeud, IP fabric 10.1.2.10
-#
-# PIEGE : si les deux nodeSelector se recouvrent, un noeud recoit deux instances
-# BGP et tente de joindre le leaf de l'autre — sans route pour y aller. Symptome :
-# une session Established et une session bloquee en Active/Connect. Verifie tes
-# selecteurs avant d'accuser FRR.
+# Structure strictement symetrique de bgp-leaf1.yaml : le raisonnement de fond
+# (pourquoi un fichier par peering, pourquoi un ASN par noeud, ce que fait
+# localPort, pourquoi ce routerID) y est detaille et n'est pas redonde ici.
+# Ne sont commentes ci-dessous que les points ou ce fichier PEUT diverger.
+
+apiVersion: cilium.io/v2
+kind: CiliumBGPClusterConfig
+metadata:
+  # Ressource cluster-scoped : nom distinct de celui de bgp-leaf1.yaml, sinon le
+  # 2eme apply ecraserait le 1er au lieu d'ajouter un peering.
+  name: cilium-bgp-leaf2
+spec:
+  # Doit rester DISJOINT du nodeSelector de bgp-leaf1.yaml : un recouvrement
+  # donnerait deux instances BGP au meme noeud, dont une vers un leaf qu'il n'a
+  # aucune route pour joindre. Symptome : une session Established, une bloquee
+  # en Active/Connect.
+  nodeSelector:
+    matchLabels:
+      fabric: leaf2
+  bgpInstances:
+  - name: "instance-65222"
+    # Un ASN par noeud, cf. la regle et sa justification dans bgp-leaf1.yaml.
+    localASN: 65222
+    localPort: 179
+    peers:
+    - name: "leaf2"
+      peerASN: 65012
+      # Adresse de leaf2 sur le lien fabric (eth3 cote leaf).
+      peerAddress: 10.1.2.1
+      # Meme profil de session que le peering leaf1 : un seul objet pour les deux.
+      peerConfigRef:
+        name: "cilium-peer"
+
+---
+
+apiVersion: cilium.io/v2
+kind: CiliumBGPNodeConfigOverride
+metadata:
+  # Nom de l'objet = nom du noeud, c'est la cle d'association cote Cilium.
+  name: l3bgp-cluster-worker2
+spec:
+  bgpInstances:
+    # Doit correspondre EXACTEMENT au nom de l'instance ci-dessus, sinon
+    # l'override ne s'applique a rien, silencieusement.
+    - name: "instance-65222"
+      # IP fabric de worker2 : stable car declaree dans clab/leaf-spine.clab.yml.
+      routerID: "10.1.2.10"
