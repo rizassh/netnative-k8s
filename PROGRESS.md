@@ -596,3 +596,133 @@ le trafic pod↔pod, appris par eBGP. Le trou volontairement laissé le 24/07
   `bgp-leaf1.yaml` ont été rédigés par Claude Code à partir de mes décisions. Le contenu
   est vérifié (les affirmations sur le next-hop et l'AS-path ont été prouvées ci-dessus),
   mais **je dois pouvoir les réexpliquer sans les lire**. S'ajoute à la liste du 01/08.
+
+## 2026-08-04 (soir) — Phase 2 (valley routing éliminé + doc des preuves)
+
+- **Fait — `docs/apres-bgp.md` complété** (dette du 01/08, enfin soldée). Le doc ne
+  montrait que les pings et la table de routage : il prouvait *que* ça marche, pas
+  *par où*. Ajout de 6 sections, captures fraîches prises sur le lab :
+  `show bgp summary` sur leaf1 **et** leaf2, `cilium-dbg bgp peers` +
+  `routes advertised` sur les 3 agents, ECMP sur leaf1, AS-path sur spine1, et le
+  **traceroute pod → pod** annoté saut par saut.
+  - Détail relevé à la collecte : le traceroute passe cette fois par **spine2**
+    (`10.0.0.4`) alors que la capture de l'après-midi passait par spine1. C'est une
+    meilleure preuve d'ECMP que la première — le chemin change entre deux runs.
+  - Le saut 6 est un `*` : le datapath eBPF de Cilium sur worker2 n'émet pas de
+    `ICMP time-exceeded`. Absence de réponse ≠ absence de saut. **Interprétation, pas
+    mesure** — à confirmer un jour au `tcpdump` sur `eth1` de worker2.
+
+- **Fait — `clab/configs/spine2/frr.conf` : masque `/32` manquant** sur le loopback.
+  Sans masque, FRR applique un préfixe classful.
+
+- **Trouvaille — valley routing dans la fabric.** En relisant la table de spine2 :
+  des chemins comme `10.1.1.0/24 via leaf2, AS-path 65012 65001 65011`, c'est-à-dire
+  **un leaf faisant transit entre deux spines**. Interdit dans un design RFC 7938.
+  - Symptôme visible : `PfxRcd` **asymétrique** — 4 sur spine1, 7 sur spine2.
+  - **Le mécanisme, qui n'est pas celui qu'on croit** : leaf2 annonce *exactement les
+    mêmes 8 préfixes aux deux spines* (vérifié en `advertised-routes`). L'asymétrie
+    n'est pas dans ce qui est émis, mais dans ce qui est **accepté** : spine1 voit son
+    propre ASN `65001` dans l'AS-path et rejette (prévention de boucle eBGP), spine2 non.
+  - **Pourquoi toujours spine1 qui empoisonne** : sur les leaves, les deux chemins vers
+    un préfixe distant sont à égalité sur tous les critères, le tie-break descend jusqu'au
+    **Router-ID** (`10.255.0.1` < `10.255.0.2`) — FRR l'écrit littéralement
+    `best (Router ID)`. Le bestpath passe donc toujours par spine1, et BGP ne réannonce
+    que le bestpath → le chemin réannoncé contient toujours `65001`.
+    **C'est un artefact de numérotation, pas de topologie** : inverser les loopbacks des
+    spines inverserait l'asymétrie.
+  - L'exception qui confirme : `10.255.0.2/32` est originée *par* spine2, donc son
+    bestpath contient `65002` → cette fois c'est spine1 qui l'accepte. La vallée s'inverse
+    pour ce seul préfixe.
+
+- **Fait — filtre AS-path en sortie des leaves vers les spines** (`clab/configs/leaf1|leaf2`) :
+  ```
+  bgp as-path access-list LOCAL_AS seq 5  permit ^$
+  bgp as-path access-list LOCAL_AS seq 10 permit ^65111$    # ^65222$ sur leaf2
+  route-map eBGP_SPINE_OUT permit 10
+   match as-path LOCAL_AS
+  ```
+  Règle RFC 7938 : *un leaf n'annonce que ce qu'il origine ou ce qui vient d'en dessous*.
+  - **`^$` est la ligne clé, et c'est là que je me suis planté.** Premier essai :
+    `permit 65011{0-1}`, en cherchant à matcher mon propre ASN. Résultat : leaf1
+    n'annonçait plus **rien**. Un routeur ajoute son ASN à l'AS-path **en sortie, après
+    l'évaluation de la route-map** — au moment du match, une route qu'il origine a un
+    AS-path **vide**. `65011` n'y sera jamais. (Bonus : `{0-1}` n'est pas une syntaxe
+    POSIX valide — c'est `{m,n}` — et un quantificateur porte sur le caractère précédent,
+    donc sur `1`, pas sur `65011`. FRR stocke la chaîne sans la valider.)
+  - **Les ancres `^` et `$` sont obligatoires** : `match as-path` fait un match de
+    **sous-chaîne**. Sans ancres, `65111` matcherait aussi `65001 65011 65111` et
+    réautoriserait la vallée qu'on cherche à tuer.
+  - Deux entrées plutôt qu'un `^(65111)?$` condensé : une access-list est un OU implicite,
+    et deux règles conceptuellement distinctes (« ce que j'origine » / « ce que mon
+    serveur origine ») se lisent mieux séparées.
+  - **Limite connue** : `^65111$` refuse un AS-path prependé. Si un jour prepending sur
+    le nœud kind, il faudra `^65111(_65111)*$`.
+
+- **Validé (lab en cours, pas encore après redeploy)** :
+  - `advertised-routes` : **3 préfixes** par leaf vers chaque spine (son lien, sa
+    loopback, le podCIDR de son nœud).
+  - `PfxRcd = 3` sur spine1 **et** spine2 depuis les deux leaves → **asymétrie disparue**.
+  - Table de spine1 : `7 routes / 7 paths` (avant : 8/9 sur spine1, 8/15 sur spine2)
+    → **un seul chemin par préfixe, plus aucune route de vallée**.
+  - **Non-régression OK** : ECMP intact sur leaf1 (`10.244.2.0/24` garde ses deux
+    next-hops `weight 1`), traceroute pod→pod inchangé, ping inter-nœud 0% de perte.
+  - **Conséquence attendue, pas un bug** : spine1 ne connaît plus `10.255.0.2/32`, la
+    loopback de spine2 — elle ne lui parvenait que relayée par un leaf. Dans un design
+    leaf-spine, deux spines n'ont aucune raison de se parler.
+
+- **Alternative étudiée et écartée : le tag par communauté BGP.** Idée : tagger les routes
+  légitimes à l'origine, filtrer sur présence de la communauté côté spines.
+  - **Ça marche, et c'est ce que font les vraies fabriques** (designs Cumulus/Arista),
+    mais à condition de tagger **là où la provenance est connue** — à l'origination et à
+    l'entrée depuis le nœud kind. Tagger en sortie vers les spines taggerait aussi les
+    routes de vallée et le filtre serait inopérant. La communauté ne supprime pas la
+    question « qu'est-ce qu'une route légitime », elle la **déplace du filtre vers l'origine**.
+  - **Gain réel** : ça scale (ajouter un nœud = tagger à l'entrée, aucun filtre à éditer
+    ailleurs), c'est auto-documenté, et ça découple les spines du plan d'ASN.
+  - **Écarté pour l'instant** : à 2 spines / 2 leaves le regex AS-path fait le travail en
+    3 lignes. Le gain apparaît à l'échelle (8 spines, 40 leaves).
+  - **La vraie objection, à savoir défendre** : le spine accepte une route parce qu'elle
+    *prétend* porter la bonne communauté. Un nœud kind — machine joignable par des
+    utilisateurs — pourrait la poser lui-même. Parade standard : **effacer les
+    communautés en entrée** depuis les pairs non fiables avant de poser les siennes.
+    Même remarque si un jour on fait tagger le podCIDR par `CiliumBGPAdvertisement`
+    (qui sait poser des communautés) : ça revient à laisser le cluster s'auto-déclarer légitime.
+
+- **Piège rencontré au portage de la config — à ne jamais refaire.** J'ai d'abord porté
+  la route-map dans les fichiers en collant la sortie de `show run`. Ça a **supprimé**
+  `frr defaults datacenter` et `no bgp ebgp-requires-policy` des deux leaves.
+  **`show running-config` n'affiche pas les lignes qui correspondent aux défauts courants** —
+  et ces défauts venaient justement de la ligne que je supprimais. Sans le profil,
+  `ebgp-requires-policy` repasse à ON → RFC 8212 → sessions Established et **zéro préfixe**.
+  Exactement le symptôme documenté dans `apres-bgp.md`, que je me serais réinfligé sans
+  faire le lien. Corrigé en repartant de l'ancienne conf et en ajoutant les lignes à la main.
+  → **Règle : `show run` n'est pas une source de config.** Le diff d'un portage doit être
+  **purement additif** ; toute suppression est suspecte.
+
+- **Bloqué** : —
+- **Prochaine étape** :
+  1. **`clab destroy && clab deploy` puis revérifier les 3 préfixes.** Pas encore fait —
+     c'est la seule preuve que les fichiers sont autosuffisants, et c'est précisément là
+     que le piège `show run` se serait manifesté. À faire **avant** toute autre chose.
+  2. Ajouter une section « valley routing » à `docs/apres-bgp.md` (les captures avant/après
+     existent déjà : `PfxRcd` 4/7 → 3/3, spine1 8 routes/9 paths → 7/7).
+  3. **Pool LoadBalancer** — le vrai livrable manquant de la phase 2 :
+     `CiliumLoadBalancerIPPool` + un 2ème `CiliumBGPAdvertisement` de type `Service`.
+     C'est là que le lien par label selector du PeerConfig prend son sens. À réfléchir
+     avant de coder : le podCIDR est un préfixe **par nœud** (/24), une VIP de Service est
+     une **/32 annoncée par tous les nœuds portant un endpoint** — qu'est-ce que ça change
+     pour l'ECMP côté leaf, et veut-on `externalTrafficPolicy: Local` ou `Cluster` ?
+  4. Ensuite seulement, phase 3 (GitOps ArgoCD).
+
+- **Dette de compréhension (s'ajoute au 01/08 et à cet après-midi)** :
+  - **`^$`** : pourquoi un routeur préfixe son ASN *après* la route-map de sortie, donc
+    pourquoi une route originée a un AS-path vide au moment du match. Je ne l'ai pas
+    trouvé seul.
+  - **Le tie-break Router-ID** et pourquoi il détermine quel spine reçoit les routes de
+    vallée. Idem.
+  - Les sections explicatives de `docs/apres-bgp.md` sont rédigées par Claude Code à
+    partir de mes mesures. Les captures sont réelles, les paragraphes non. À savoir
+    réexpliquer sans les relire, en particulier : pourquoi `multipath-relax` est
+    nécessaire alors que les AS-path ont la même longueur, pourquoi le next-hop
+    `10.1.1.10` prouve que `sourceInterface` fonctionne, et l'écart de TTL de 5 alors
+    que traceroute affiche 7 lignes.
